@@ -1,8 +1,6 @@
 package com.breakinblocks.modpackassistant.commands.world;
 
-import com.breakinblocks.modpackassistant.commands.CommandResults;
 import com.breakinblocks.modpackassistant.commands.MAPermissions;
-import com.breakinblocks.modpackassistant.config.MAConfig;
 import com.breakinblocks.modpackassistant.jobs.ChunkAccessor;
 import com.breakinblocks.modpackassistant.jobs.RegionGeometry;
 import com.breakinblocks.modpackassistant.jobs.Run;
@@ -13,6 +11,7 @@ import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.Util;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
@@ -21,10 +20,14 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
 
 import java.text.DecimalFormat;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.ArrayDeque;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ForkJoinPool;
 
 public final class ChunkThroughputCommand {
+    public static final int MAX_RADIUS = 5000;
+    private static final int IN_FLIGHT = 1024;
+    private static final int SCAN_PER_STEP = 4096;
     private static final DecimalFormat DECIMAL = new DecimalFormat("0.00");
 
     private ChunkThroughputCommand() {
@@ -33,7 +36,7 @@ public final class ChunkThroughputCommand {
     public static LiteralArgumentBuilder<CommandSourceStack> build() {
         return Commands.literal("chunkthroughput")
                 .requires(MAPermissions.GAMEMASTER)
-                .then(Commands.argument("radius", IntegerArgumentType.integer(0))
+                .then(Commands.argument("radius", IntegerArgumentType.integer(0, MAX_RADIUS))
                         .executes(context -> throughput(context, Integer.MIN_VALUE, Integer.MIN_VALUE))
                         .then(Commands.argument("x", IntegerArgumentType.integer())
                                 .executes(context -> throughput(context, IntegerArgumentType.getInteger(context, "x"), Integer.MIN_VALUE))
@@ -48,12 +51,6 @@ public final class ChunkThroughputCommand {
         ServerLevel level = source.getLevel();
         int radius = IntegerArgumentType.getInteger(context, "radius");
 
-        if (radius > MAConfig.maxScanRadius()) {
-            int span = 2 * radius + 1;
-            CommandResults.fail(source, Messages.RADIUS_TOO_LARGE.get(radius, MAConfig.maxScanRadius(), span * span, "max_scan_radius"));
-            return 0;
-        }
-
         ChunkPos center;
         if (xArg != Integer.MIN_VALUE && zArg != Integer.MIN_VALUE) {
             center = new ChunkPos(xArg >> 4, zArg >> 4);
@@ -65,53 +62,115 @@ public final class ChunkThroughputCommand {
         }
 
         RegionGeometry region = new RegionGeometry(center, radius);
-
-        AtomicInteger generated = new AtomicInteger();
-        AtomicInteger alreadyLoaded = new AtomicInteger();
-        AtomicLong totalGenNanos = new AtomicLong();
+        Generation generation = new Generation(level, region);
 
         Run run = new Run(source, "chunk throughput test", level.dimension());
-        for (ChunkPos chunk : region.chunks()) {
-            run.job(() -> {
-                long startNanos = System.nanoTime();
-                if (ChunkAccessor.isLoaded(level, chunk)) {
-                    alreadyLoaded.incrementAndGet();
-                } else {
-                    ChunkAccessor.withChunk(level, chunk, loaded -> {
-                        generated.incrementAndGet();
-                        return null;
-                    });
-                }
-                long elapsedNanos = System.nanoTime() - startNanos;
-                totalGenNanos.addAndGet(elapsedNanos);
-            });
-        }
-        run.onComplete(finished -> {
-            printSummary(finished, region, generated.get(), alreadyLoaded.get(), totalGenNanos.get());
-        });
+        run.repeat(generation::step);
+        run.onComplete(finished -> printSummary(finished, region, generation));
+        run.onCancel(finished -> generation.releaseAll());
 
         if (!RunScheduler.tryStart(run)) {
             return 0;
         }
         run.message(Messages.THROUGHPUT_START.get(region.spanText(), region.chunkCount(), center.x, center.z));
-        return run.total();
+        return region.chunkCount();
     }
 
-    private static void printSummary(Run run, RegionGeometry region, int generated, int alreadyLoaded, long totalGenNanos) {
-        double genSeconds = totalGenNanos / 1_000_000_000.0;
+    private static void printSummary(Run run, RegionGeometry region, Generation generation) {
+        double wallSeconds = generation.wallNanos() / 1_000_000_000.0;
 
         run.message(Component.empty());
-        run.message(Messages.THROUGHPUT_HEADER.get(region.chunkCount(), generated, alreadyLoaded));
+        run.message(Messages.THROUGHPUT_HEADER.get(region.chunkCount(), generation.generated, generation.alreadyLoaded));
 
-        if (generated > 0) {
-            double perChunk = genSeconds / generated;
-            double chunksPerSec = genSeconds > 0 ? generated / genSeconds : 0;
-            run.message(Messages.THROUGHPUT_GENERATED.get(
-                    DECIMAL.format(perChunk),
-                    DECIMAL.format(chunksPerSec)));
+        if (generation.generated > 0 && wallSeconds > 0) {
+            double chunksPerSec = generation.generated / wallSeconds;
+            int threads = workerThreads();
+            run.message(Messages.THROUGHPUT_GENERATED.get(DECIMAL.format(chunksPerSec)));
+            run.message(Messages.THROUGHPUT_PER_THREAD.get(DECIMAL.format(chunksPerSec / threads), threads));
         }
 
-        run.message(Messages.THROUGHPUT_TOTAL.get(Run.formatSeconds(totalGenNanos / 1_000_000_000L)));
-        run.message(Messages.THROUGHPUT_ELAPSED.get(run.elapsed()));
+        run.message(Messages.THROUGHPUT_ELAPSED.get(DECIMAL.format(wallSeconds)));
+    }
+
+    private static int workerThreads() {
+        ExecutorService executor = Util.backgroundExecutor();
+        return executor instanceof ForkJoinPool pool ? pool.getParallelism() : Runtime.getRuntime().availableProcessors();
+    }
+
+    private static final class Generation {
+        private final ServerLevel level;
+        private final RegionGeometry region;
+        private final ArrayDeque<ChunkPos> inFlight = new ArrayDeque<>();
+        private int cursorX;
+        private int cursorZ;
+        private boolean exhausted;
+        private int generated;
+        private int alreadyLoaded;
+        private long startNanos = -1;
+        private long endNanos;
+
+        Generation(ServerLevel level, RegionGeometry region) {
+            this.level = level;
+            this.region = region;
+            this.cursorX = region.center().x - region.radius();
+            this.cursorZ = region.center().z - region.radius();
+        }
+
+        boolean step() {
+            long now = System.nanoTime();
+            if (startNanos < 0) {
+                startNanos = now;
+            }
+
+            for (int pending = inFlight.size(); pending > 0; pending--) {
+                ChunkPos pos = inFlight.poll();
+                if (ChunkAccessor.isLoaded(level, pos)) {
+                    ChunkAccessor.releaseGeneration(level, pos);
+                    generated++;
+                } else {
+                    inFlight.add(pos);
+                }
+            }
+
+            for (int scanned = 0; !exhausted && inFlight.size() < IN_FLIGHT && scanned < SCAN_PER_STEP; scanned++) {
+                ChunkPos pos = new ChunkPos(cursorX, cursorZ);
+                advance();
+                if (ChunkAccessor.isLoaded(level, pos)) {
+                    alreadyLoaded++;
+                } else {
+                    ChunkAccessor.requestGeneration(level, pos);
+                    inFlight.add(pos);
+                }
+            }
+
+            if (exhausted && inFlight.isEmpty()) {
+                endNanos = System.nanoTime();
+                return true;
+            }
+            return false;
+        }
+
+        void releaseAll() {
+            for (ChunkPos pos : inFlight) {
+                ChunkAccessor.releaseGeneration(level, pos);
+            }
+            inFlight.clear();
+        }
+
+        long wallNanos() {
+            return endNanos - startNanos;
+        }
+
+        private void advance() {
+            int max = region.center().x + region.radius();
+            cursorZ++;
+            if (cursorZ > region.center().z + region.radius()) {
+                cursorZ = region.center().z - region.radius();
+                cursorX++;
+                if (cursorX > max) {
+                    exhausted = true;
+                }
+            }
+        }
     }
 }
