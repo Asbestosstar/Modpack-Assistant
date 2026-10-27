@@ -60,7 +60,7 @@ public final class ChunkThroughputCommand {
         } else if (source.getEntity() instanceof ServerPlayer player) {
             center = player.chunkPosition();
         } else {
-            BlockPos spawn = level.getLevelSpawnPos();
+            BlockPos spawn = level.getSharedSpawnPos();
             center = new ChunkPos(spawn);
         }
 
@@ -93,7 +93,7 @@ public final class ChunkThroughputCommand {
         if (!RunScheduler.tryStart(run)) {
             return 0;
         }
-        run.message(Messages.THROUGHPUT_START.get(region.spanText(), region.chunkCount(), center.x(), center.z()));
+        run.message(Messages.THROUGHPUT_START.get(region.spanText(), region.chunkCount(), center.x, center.z));
         return run.total();
     }
 
