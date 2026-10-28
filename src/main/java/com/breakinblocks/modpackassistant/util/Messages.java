@@ -14,7 +14,7 @@ public final class Messages {
     public static final Msg SCAN_SKIPPED = msg("scan.skipped", "Skipped %s chunks that were not loaded when scanned");
     public static final Msg SCAN_LOADED_ONLY = msg("scan.loaded_only", "Only currently loaded chunks will be scanned; terrain will not be generated");
 
-    public static final Msg THROUGHPUT_START = msg("throughput.start", "Generating chunks across %s (%s chunks) centered at chunk %s, %s");
+    public static final Msg THROUGHPUT_START = msg("throughput.start", "Generating chunks within radius %s (%s chunks) centered at chunk %s, %s");
     public static final Msg THROUGHPUT_HEADER = msg("throughput.header", "Chunk throughput: %s chunks total, %s generated, %s already loaded");
     public static final Msg THROUGHPUT_GENERATED = msg("throughput.generated", "Generated chunks: %s chunks/sec");
     public static final Msg THROUGHPUT_PER_THREAD = msg("throughput.per_thread", "Per worker thread: %s chunks/sec across %s threads");

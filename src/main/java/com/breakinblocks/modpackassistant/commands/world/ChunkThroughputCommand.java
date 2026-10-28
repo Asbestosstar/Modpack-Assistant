@@ -2,7 +2,6 @@ package com.breakinblocks.modpackassistant.commands.world;
 
 import com.breakinblocks.modpackassistant.commands.MAPermissions;
 import com.breakinblocks.modpackassistant.jobs.ChunkAccessor;
-import com.breakinblocks.modpackassistant.jobs.RegionGeometry;
 import com.breakinblocks.modpackassistant.jobs.Run;
 import com.breakinblocks.modpackassistant.jobs.RunScheduler;
 import com.breakinblocks.modpackassistant.util.Messages;
@@ -10,8 +9,8 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
-import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.Util;
+import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
@@ -61,26 +60,25 @@ public final class ChunkThroughputCommand {
             center = new ChunkPos(spawn);
         }
 
-        RegionGeometry region = new RegionGeometry(center, radius);
-        Generation generation = new Generation(level, region);
+        Generation generation = new Generation(level, center, radius);
 
         Run run = new Run(source, "chunk throughput test", level.dimension());
         run.repeat(generation::step);
-        run.onComplete(finished -> printSummary(finished, region, generation));
+        run.onComplete(finished -> printSummary(finished, generation));
         run.onCancel(finished -> generation.releaseAll());
 
         if (!RunScheduler.tryStart(run)) {
             return 0;
         }
-        run.message(Messages.THROUGHPUT_START.get(region.spanText(), region.chunkCount(), center.x, center.z));
-        return region.chunkCount();
+        run.message(Messages.THROUGHPUT_START.get(radius, generation.total, center.x, center.z));
+        return generation.total;
     }
 
-    private static void printSummary(Run run, RegionGeometry region, Generation generation) {
+    private static void printSummary(Run run, Generation generation) {
         double wallSeconds = generation.wallNanos() / 1_000_000_000.0;
 
         run.message(Component.empty());
-        run.message(Messages.THROUGHPUT_HEADER.get(region.chunkCount(), generation.generated, generation.alreadyLoaded));
+        run.message(Messages.THROUGHPUT_HEADER.get(generation.total, generation.generated, generation.alreadyLoaded));
 
         if (generation.generated > 0 && wallSeconds > 0) {
             double chunksPerSec = generation.generated / wallSeconds;
@@ -99,7 +97,10 @@ public final class ChunkThroughputCommand {
 
     private static final class Generation {
         private final ServerLevel level;
-        private final RegionGeometry region;
+        private final int centerX;
+        private final int centerZ;
+        private final int radius;
+        private final int total;
         private final ArrayDeque<ChunkPos> inFlight = new ArrayDeque<>();
         private int cursorX;
         private int cursorZ;
@@ -109,11 +110,14 @@ public final class ChunkThroughputCommand {
         private long startNanos = -1;
         private long endNanos;
 
-        Generation(ServerLevel level, RegionGeometry region) {
+        Generation(ServerLevel level, ChunkPos center, int radius) {
             this.level = level;
-            this.region = region;
-            this.cursorX = region.center().x - region.radius();
-            this.cursorZ = region.center().z - region.radius();
+            this.centerX = center.x;
+            this.centerZ = center.z;
+            this.radius = radius;
+            this.cursorX = centerX - radius;
+            this.cursorZ = centerZ - radius;
+            this.total = countWithin(radius);
         }
 
         boolean step() {
@@ -135,6 +139,9 @@ public final class ChunkThroughputCommand {
             for (int scanned = 0; !exhausted && inFlight.size() < IN_FLIGHT && scanned < SCAN_PER_STEP; scanned++) {
                 ChunkPos pos = new ChunkPos(cursorX, cursorZ);
                 advance();
+                if (!withinRadius(pos)) {
+                    continue;
+                }
                 if (ChunkAccessor.isLoaded(level, pos)) {
                     alreadyLoaded++;
                 } else {
@@ -161,16 +168,41 @@ public final class ChunkThroughputCommand {
             return endNanos - startNanos;
         }
 
+        private boolean withinRadius(ChunkPos pos) {
+            long dx = pos.x - centerX;
+            long dz = pos.z - centerZ;
+            return dx * dx + dz * dz <= (long) radius * radius;
+        }
+
         private void advance() {
-            int max = region.center().x + region.radius();
             cursorZ++;
-            if (cursorZ > region.center().z + region.radius()) {
-                cursorZ = region.center().z - region.radius();
+            if (cursorZ > centerZ + radius) {
+                cursorZ = centerZ - radius;
                 cursorX++;
-                if (cursorX > max) {
+                if (cursorX > centerX + radius) {
                     exhausted = true;
                 }
             }
+        }
+
+        private static int countWithin(int radius) {
+            long squared = (long) radius * radius;
+            int count = 0;
+            for (long dx = -radius; dx <= radius; dx++) {
+                count += 2 * isqrt(squared - dx * dx) + 1;
+            }
+            return count;
+        }
+
+        private static long isqrt(long value) {
+            long root = (long) Math.sqrt(value);
+            while (root * root > value) {
+                root--;
+            }
+            while ((root + 1) * (root + 1) <= value) {
+                root++;
+            }
+            return root;
         }
     }
 }
